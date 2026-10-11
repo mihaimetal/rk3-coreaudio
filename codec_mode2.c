@@ -19,32 +19,35 @@ void caiaq_capture_mode2(struct caiaq_codec *c,
 			 const uint8_t *usb, int usb_len,
 			 uint8_t *pcm, int *pcm_pos, int pcm_size)
 {
-	int i = 0;
-
-	while (i < usb_len) {
-		/* check byte at the start of every 4-byte group (read_in_urb_mode2) */
-		if ((i & 3) == 0) {
-			if (!c->first_packet) {
-				if ((usb[i] & 0x3f) != checkbyte0(i))
-					c->input_panic = 1;
-				if (usb[i] & 0x80)
-					c->output_panic = 1;
-			}
-			i++;
-			if (i >= usb_len)
-				break;
+	/* Validate the whole packet first: check byte at the start of every 4-byte
+	 * group (read_in_urb_mode2). */
+	int bad = 0, out_panic = 0;
+	for (int i = 0; i < usb_len; i += 4) {
+		if ((usb[i] & 0x3f) != checkbyte0(i))
+			bad = 1;
+		if (usb[i] & 0x80)
+			out_panic = 1;
+	}
+	if (c->first_packet) {
+		c->first_packet--;            /* start-up grace: mute, don't flag */
+	} else {
+		if (bad) {
+			c->input_panic = 1;
+			c->input_errs++;
 		}
-		if (c->first_packet)
-			c->first_packet--;
+		if (out_panic)
+			c->output_panic = 1;
+	}
 
-		/* one audio data byte */
+	for (int i = 0; i < usb_len; i++) {
+		if ((i & 3) == 0)
+			continue;                 /* check byte */
 		if (pcm) {
-			pcm[*pcm_pos] = c->input_panic ? 0 : usb[i];
+			pcm[*pcm_pos] = bad ? 0 : usb[i];
 			*pcm_pos += 1;
 			if (*pcm_pos == pcm_size)
 				*pcm_pos = 0;
 		}
-		i++;
 	}
 }
 

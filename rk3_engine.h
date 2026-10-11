@@ -30,6 +30,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Transport constants (identical to stream.c). */
@@ -112,6 +113,95 @@ _Static_assert(RK3_FRAMES_PER_XFER % RK3_OUT_FRAMES_PER_XFER == 0,
 _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
 	"iso_xfer arrays are sized for FPX; OUT_FPX must not exceed it");
 #define RK3_OUT_MIN_LEAD    24
+
+/*
+ * Runtime transport geometry. RK3_FRAMES_PER_XFER / RK3_OUT_FRAMES_PER_XFER /
+ * RK3_N_OUT_XFERS above are now only the DEFAULTS (and RK3_FRAMES_PER_XFER the
+ * array bound): the live values are e->in_fpx / e->out_fpx / e->n_out, latched
+ * from the pending e->tune_* at every audio_start (rk3_engine_set_tuning, or a
+ * "TUNE ..." datagram on the LED socket). This lets one installed build sweep
+ * transfer sizes without a reinstall. Constraints (rk3_engine_set_tuning rejects
+ * anything else): fpx in {8,16,32} (whole ms-frames, <= the array bound),
+ * out_fpx divides in_fpx, 2 <= n_out <= RK3_MAX_OUT_XFERS, and the steady-state
+ * OUT lead (n_out-1)*out_fpx/8 must be >= 2 ms — measured in tools/enginetest:
+ * with a 1 ms lead (out_fpx=8, n_out=2) the host rejects about every 4th submit.
+ */
+#define RK3_MAX_OUT_XFERS   8
+
+/*
+ * Shipped geometry: 1 ms transfers both ways, 3 OUT transfers in flight (2000
+ * isoc completions/s). Measured on an M-series Mac, macOS 26, 48 kHz / 64-frame
+ * buffer, analog loopback (iotest --latency), driver-process CPU of one core:
+ *     in/out fpx x n_out   completions/s   round trip   CPU
+ *     32/16 x2 (old)            750         11.2-11.8 ms  13.5%
+ *     16/8  x3                 1500          8.8 ms       22%
+ *      8/8  x3                 2000          7.9 ms       38%
+ * The old "~1000/s is fatal" ceiling did not reproduce: 1000/1500/2000 per second
+ * all ran clean both in tools/enginetest and inside the driver process (no
+ * errors, breaker never tripped). The price of the small transfers is CPU: a
+ * `sample` profile puts ~290 us in each ReadIsochPipeAsync and ~155 us in each
+ * WriteIsochPipeAsync, all of it inside the kernel call; the engine's own code is
+ * ~2% of that. `tools/rk3-tune 16 8 3` trades ~1 ms back for less CPU.
+ * (Tried and dropped: requesting only bpp bytes per IN microframe instead of the
+ * 512-byte max packet — no cheaper, and capture came back empty.)
+ */
+#define RK3_DEFAULT_IN_FPX   8
+#define RK3_DEFAULT_OUT_FPX  8
+#define RK3_DEFAULT_N_OUT    3
+
+/*
+ * Completion-rate circuit breaker. The isoc chains self-resubmit from their own
+ * completion callbacks on a real-time thread inside coreaudiod, so anything that
+ * makes completions return faster than the bus can physically deliver them is a
+ * spin that takes the whole audio subsystem down. Every RK3_BRK_WINDOW isoc
+ * completions the engine compares the elapsed time against the nominal rate
+ * (8000/in_fpx + 8000/out_fpx per second); a window that took less than
+ * 1/RK3_BRK_RATIO of nominal trips the breaker: resubmission stops at once
+ * (audio_running=0, fault=1) and the watchdog timer re-primes the chains after a
+ * pause, at most RK3_BRK_MAX_RESTARTS times per audio_start. A legitimate burst
+ * after a run-loop stall is bounded by the in-flight depth (RK3_N_XFERS + n_out
+ * <= 16 completions), well under the window. A submit that still fails after its
+ * retries (a chain member would silently die) trips it too.
+ */
+#define RK3_BRK_WINDOW        64
+#define RK3_BRK_RATIO         4
+#define RK3_BRK_MAX_RESTARTS  5
+#define RK3_BRK_RESULTS       6     /* distinct completion result codes tallied */
+
+/*
+ * Adaptive margins. The ring targets above (RK3_OUT_FILL_SETPOINT,
+ * RK3_CAP_FILL_FLOOR) and the OUT pipeline depth are the TIGHTEST the driver
+ * will run, tuned against an idle test client. A DAW under load misses them: a
+ * 9-minute session at 44.1 kHz / 512 frames logged a dozen playback-underrun
+ * events (host IO cycles arriving later than the 1.5 ms ring margin) and 21
+ * rejected OUT submits (this thread's completion callback arriving later than
+ * the 2 ms pipeline lead). So each margin widens itself when it is actually
+ * missed and gives the extra back slowly once things have been quiet:
+ *
+ *  - OUT ring / capture ring: an underrun adds its own shortfall (capped at
+ *    RK3_ADAPT_BUMP_MAX_MS) plus RK3_ADAPT_BUMP_MS to that ring's target, up to
+ *    RK3_ADAPT_MAX_MS in total; every RK3_ADAPT_DECAY_S without one takes 1/16
+ *    of the extra back (half-life ~5 min).
+ *  - OUT pipeline: a rejected submit adds one in-flight transfer (+1 stride of
+ *    lead), at most RK3_ADAPT_MAX_GROW over the tuned n_out;
+ *    RK3_ADAPT_SHRINK_S without a rejection removes one.
+ *  - One step per disturbance: after any of the three widens, it will not
+ *    widen again for RK3_ADAPT_HOLD_S. A single event (a file dragged into the
+ *    DAW held this thread up for ~12 s) used to be answered three times over —
+ *    pipeline +3, capture margin +4.4 ms — and kept for ten minutes.
+ *
+ * Nothing is learned in the first RK3_ADAPT_WARMUP_S of a stream (the start-up
+ * transient is not representative). The learned extras survive StopIO/StartIO
+ * and are cleared by rk3_engine_set_tuning. They show in the clk: log line.
+ */
+#define RK3_ADAPT_WARMUP_S     8
+#define RK3_ADAPT_BUMP_MS      1
+#define RK3_ADAPT_BUMP_MAX_MS  3
+#define RK3_ADAPT_MAX_MS       15
+#define RK3_ADAPT_DECAY_S      30
+#define RK3_ADAPT_MAX_GROW     3
+#define RK3_ADAPT_HOLD_S       15
+#define RK3_ADAPT_SHRINK_S     180
 #define RK3_PAT_RING        256
 
 /*
@@ -128,10 +218,16 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
  * Proven equivalent to the basic path in tools/stream.c --lowlat (clean tone,
  * 0 errors, identical OUT byte-rate) before being brought in here.
  */
-#define RK3_USE_LOWLAT      0   /* TEMP: reverted after a coreaudiod storm on the
-                                 * first LL engine install (2026-06-22). Basic path
-                                 * is the safe known-good. Re-enable once the LL
-                                 * storm is diagnosed (see HANDOFF_LATENCY notes). */
+#ifndef RK3_USE_LOWLAT
+#define RK3_USE_LOWLAT      0   /* Off, and no reason to turn it on: measured in
+                                 * `make enginetest-ll` at 2000 transfers/s it
+                                 * streams cleanly but costs the same CPU as the
+                                 * basic calls (26.0% vs 26.5% of a core) and the
+                                 * same latency. The per-transfer cost is the
+                                 * kernel submit itself (~290 us per IN, ~155 us
+                                 * per OUT in a `sample` profile), not buffer
+                                 * wiring, so pre-wired buffers do not help. */
+#endif
 #define RK3_LL_UPDATE_FREQ  0   /* 0 = update at completion only (1:1 mode) */
 
 #if RK3_USE_LOWLAT
@@ -204,8 +300,19 @@ typedef IOUSBIsocFrame           rk3_isoc_frame_t;
  * (14.31 -> 12.38 ms loopback); 160 gave NO further fill reduction (the new consumer-
  * bite floor), so 176 is the settled sweet spot with clear margin. Revert to 224 if
  * a real DAW load ever underruns here.
+ *
+ * SEMANTICS CHANGED (trough servo): everything above describes a setpoint for the
+ * MEAN fill, which had to be re-derived by hand for every consumer bite (transfer
+ * size) and silently assumed a 64-frame host buffer — the mean needed is
+ * trough + bite/2 + host_buffer/2, so a DAW at 256/512 frames underran. The servo
+ * now controls the TROUGH directly: rk3_engine_out_trough() returns the lowest
+ * post-consume fill since the previous servo step, and the servo holds THAT at
+ * this value. It is therefore the jitter margin itself (frames at 48 kHz) —
+ * independent of transfer size and host buffer size, both of which simply ride
+ * on top. 72 reproduces the trough the old mean setpoint of 176 gave at 2 ms OUT
+ * transfers / 64-frame buffer.
  */
-#define RK3_OUT_FILL_SETPOINT 176
+#define RK3_OUT_FILL_SETPOINT 72
 
 /*
  * One-time startup drain target for the CAPTURE ring (frames). Capture is the
@@ -256,12 +363,35 @@ typedef IOUSBIsocFrame           rk3_isoc_frame_t;
  * capture trough, so the failure mode is a CAPTURE underrun (input click), not a storm.
  * MEASURE: watch cap_fill (min) + in_errs/in underruns in the driver-log across a full
  * 10 s run; if the trough dips toward 0 or input clicks, REVERT to 140 (one line).
+ *
+ * SEMANTICS CHANGED: the floor is now the capture ring's MARGIN — the frames left
+ * right after a host read (see cap_margin) — not the fill before it. The pre-read
+ * fill has to cover the host buffer first, so the old pre-read floor of 120 only
+ * meant "56 frames of margin" at a 64-frame buffer; at 128+ it sat below the
+ * buffer size and every read underran (and, with the periodic re-drain, spliced
+ * once a second). 56 keeps that same margin at any buffer size.
  */
-#define RK3_CAP_FILL_FLOOR    120
-#define RK3_CAP_SETTLE_FRAMES  (5 * 48000)         /* ~5 s: the IN transient (dev_rate 48200->48013
-                                                    * AND the cap balloon) is still building at 2 s;
-                                                    * measuring then is garbage. Wait it out fully. */
+#define RK3_CAP_FILL_FLOOR    56
+#define RK3_CAP_SETTLE_FRAMES  (2 * 48000)         /* ~2 s before the FIRST drain. Was 5 s (the IN
+                                                    * transient is still building at 2 s) when that
+                                                    * drain was the only one; the periodic re-drain
+                                                    * below now mops up whatever arrives later. */
 #define RK3_CAP_MEASURE_FRAMES (48000 / 2)         /* ~0.5 s window to find the (now stable) trough */
+/*
+ * Continuous capture re-drain. In a duplex loop the host reads N and writes N
+ * frames per cycle, so (OUT ring fill + capture ring fill) is CONSERVED: when the
+ * OUT servo eases the playback ring down to its trough target, exactly that many
+ * frames reappear as standing fill in the capture ring. A single drain at ~5.5 s
+ * therefore froze in whatever the servo had not yet shed (measured: capture
+ * trough left at 112 with a floor of 48), and any later underrun's inserted
+ * silence became permanent latency. So after the first drain the trough is
+ * re-measured over every RK3_CAP_REDRAIN_FRAMES window and, if it sits more than
+ * RK3_CAP_REDRAIN_HYST above the floor, the excess is dropped again (a splice of
+ * well under a millisecond on the input; none once the servo has settled).
+ */
+#define RK3_CAP_REDRAIN_FRAMES (3 * 48000)          /* 3 s trough window */
+#define RK3_CAP_REDRAIN_HYST   48                   /* 1 ms: don't chase noise (1 s / 0.5 ms
+                                                    * spliced 41 times in 9 min under a DAW) */
 
 /* The constants above are all expressed at the 48 kHz reference rate. They are
  * fixed amounts of time / producer-consumer bite, so they scale linearly with the
@@ -271,6 +401,9 @@ typedef IOUSBIsocFrame           rk3_isoc_frame_t;
 	((int)(((long long)(base48k) * (rate)) / RK3_RATE_REF))
 
 struct rk3_engine;
+
+/* Tally of one distinct isoc completion result code (telemetry). */
+struct rk3_res { IOReturn code; unsigned n; };
 
 struct rk3_iso_xfer {
 	struct rk3_engine *e;
@@ -311,6 +444,9 @@ struct rk3_engine {
 	int cap_fill_floor;     /* frames: capture-drain trough floor */
 	int cap_settle_init;    /* frames: settle wait before measuring the cap trough */
 	int cap_measure_init;   /* frames: cap-trough measurement window */
+	int cap_redrain_init;   /* frames: trough window for the periodic re-drain */
+	int cap_redrain_hyst;   /* frames: excess over the floor that triggers one */
+	unsigned cap_drains;    /* drains performed since audio_start (telemetry) */
 
 	atomic_int running;        /* 1 while the engine thread/runloop is alive */
 	atomic_int audio_running;  /* 1 while the isoc audio chains should resubmit.
@@ -326,7 +462,43 @@ struct rk3_engine {
 	int start_rc;              /* startup result reported back to caller */
 
 	struct rk3_iso_xfer in[RK3_N_XFERS];
-	struct rk3_iso_xfer out[RK3_N_OUT_XFERS];
+	struct rk3_iso_xfer out[RK3_MAX_OUT_XFERS];
+
+	/* Transport geometry: pending (any thread) and live (latched at audio_start,
+	 * then engine-thread only). Setpoint/floor are 48 kHz-reference frames. */
+	atomic_int tune_in_fpx, tune_out_fpx, tune_n_out;
+	atomic_int tune_out_setpoint, tune_cap_floor;
+	int in_fpx, out_fpx, n_out;
+	/* Next ms-frame to schedule on each chain. One shared cursor per direction
+	 * keeps the transfers contiguous and in submit order even across a late
+	 * callback (the cursor is pulled forward to the bus frame; see submit_*). */
+	UInt64 in_next, out_next;
+	unsigned in_resyncs, out_resyncs;
+
+	/* Circuit breaker + watchdog (engine thread, except the atomics). */
+	atomic_int audio_wanted;   /* between audio_start and audio_stop */
+	atomic_int fault;          /* 0 ok, 1 tripped, 2 pipes aborted (awaiting re-prime) */
+	/* Adaptive margins (see RK3_ADAPT_*). out_extra/cap_extra are frames at the
+	 * current rate, added to out_fill_setpoint / cap_fill_floor; written on the
+	 * IO thread, read by telemetry. The n_out_* fields are engine-thread only. */
+	atomic_int out_extra, cap_extra;
+	UInt64     audio_t0;        /* mach time of the last audio_start */
+	UInt64     out_decay_t;     /* mach time of the last OUT bump or decay */
+	UInt64     out_bump_t;      /* mach time of the last OUT bump (hold-off) */
+	int        cap_quiet;       /* frames read since the last capture bump/decay */
+	int        cap_holdoff;     /* frames until the next capture bump may happen */
+	int        n_out_base;      /* tuned n_out; the live n_out may be above it */
+	int        out_errs_seen;   /* out_errs already acted on */
+	UInt64     out_err_time;    /* mach time of the last rejected OUT submit */
+	UInt64     out_grow_time;   /* mach time of the last pipeline grow */
+	int        out_shrink;      /* drop the last OUT transfer at its next completion */
+
+	unsigned   brk_cb;         /* completions in the current rate window */
+	UInt64     brk_t0;         /* mach time the window opened */
+	UInt64     fault_time;     /* mach time of the trip */
+	int        restarts;       /* watchdog re-primes since audio_start */
+	CFRunLoopTimerRef wd_timer;
+	struct rk3_res in_res[RK3_BRK_RESULTS], out_res[RK3_BRK_RESULTS];
 
 	/* capture ring: engine producer (cap_w), caller consumer (cap_r). */
 	uint8_t cap_buf[RK3_RING_BYTES];
@@ -345,6 +517,9 @@ struct rk3_engine {
 	uint8_t pb_buf[RK3_RING_BYTES];
 	atomic_uint pb_w, pb_r;
 	atomic_int  pb_started;    /* 0 until CoreAudio buffers OUT_CUSHION */
+	atomic_uint out_trough;    /* lowest post-consume fill (frames) since the last
+	                            * servo step; ~0u = no sample. See out_trough(). */
+	unsigned    servo_underruns; /* pb_underruns at the last servo step (IO thread) */
 
 	/* OUT cadence mirror (engine-thread only; no locking). */
 	int pat[RK3_PAT_RING][RK3_FRAMES_PER_XFER];
@@ -358,6 +533,7 @@ struct rk3_engine {
 
 	/* diagnostics */
 	atomic_uint cap_overruns, pb_underruns, pb_overruns;
+	atomic_uint cap_underruns;  /* reads zero-filled after the first drain */
 	int in_errs, out_errs, out_drops;
 
 	/* clock/fill telemetry: total stereo frames captured (device clock), and a
@@ -460,15 +636,36 @@ void rk3_engine_audio_stop(struct rk3_engine *e);
  */
 int  rk3_engine_set_rate(struct rk3_engine *e, int rate);
 
+/*
+ * Queue new transport geometry + fill targets; they take effect at the next
+ * audio_start. A value of 0 leaves that parameter unchanged. Returns 0 if the
+ * resulting combination is valid, -1 (nothing changed) otherwise.
+ */
+int  rk3_engine_set_tuning(struct rk3_engine *e, int in_fpx, int out_fpx,
+			   int n_out, int out_setpoint48, int cap_floor48);
+/* Device-side latency (frames at the current rate) for the HAL latency property. */
+int  rk3_engine_out_latency_frames(const struct rk3_engine *e);
+int  rk3_engine_in_latency_frames(const struct rk3_engine *e);
+/* 1 while the breaker has audio stopped (cleared when the watchdog re-primes). */
+int  rk3_engine_fault(struct rk3_engine *e);
+#ifdef RK3_TEST_HOOKS
+/* tools/enginetest only: feed the breaker a burst of fake completions on the
+ * engine thread, to exercise the trip + watchdog recovery path on demand. */
+void rk3_engine_test_burst(struct rk3_engine *e);
+#endif
+
 /* Servo steady-state OUT-fill target in frames, rate-scaled (RK3_OUT_FILL_SETPOINT
  * at 48 kHz). Read by the driver's rate servo + latency reporting. */
-int  rk3_engine_out_fill_setpoint(const struct rk3_engine *e);
+int  rk3_engine_out_fill_setpoint(struct rk3_engine *e);
 
 /*
  * 1 if a USB completion reported the device gone (unplugged) since open. The
  * plugin supervisor polls this to close + reopen the engine on the next attach.
  */
 int  rk3_engine_usb_dead(struct rk3_engine *e);
+/* 0 once the device instance the engine opened has been detached (unplug, or a
+ * re-enumeration): the handle is stale and the engine must be closed/reopened. */
+int  rk3_engine_present(const struct rk3_engine *e);
 
 /*
  * Convenience composites (open+audio_start / audio_stop+close) preserving the
@@ -492,5 +689,15 @@ void rk3_engine_write_output(struct rk3_engine *e, const float *src, int nframes
  * from the CoreAudio IO thread; reads the same atomics as the float bridges.
  */
 int rk3_engine_out_fill_frames(struct rk3_engine *e);
+
+/*
+ * Servo input: the OUT ring's trough (lowest fill right after the engine consumed
+ * a transfer) over the interval since the previous call, in frames. Returns false
+ * while playout has not started or no transfer was consumed in the interval. If
+ * the ring underran in the interval the trough is reported as -setpoint (a full
+ * margin short) so the servo pushes back up decisively instead of sitting at 0.
+ * Call from one thread only (the servo's).
+ */
+bool rk3_engine_out_trough(struct rk3_engine *e, int *trough);
 
 #endif /* RK3_ENGINE_H */

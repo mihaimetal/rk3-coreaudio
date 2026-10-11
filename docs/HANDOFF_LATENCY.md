@@ -1,3 +1,5 @@
+> **Superseded (2026-10).** See the note at the top of `HANDOFF_LATENCY2.md`.
+
 # RK3 CoreAudio — LATENCY HANDOFF (for a fresh agent after /clear)
 
 **Your one job:** reduce the round-trip audio latency of the RigKontrol 3 CoreAudio

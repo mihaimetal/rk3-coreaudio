@@ -54,7 +54,13 @@ struct rk3_axis {
 	int sw_cc;       /* derived on/off switch CC; RK3_CC_OFF = none */
 	int sw_on;       /* switch -> ON  when value >= sw_on  (0..127) */
 	int sw_off;      /* switch -> OFF when value <  sw_off (hysteresis gap) */
+	int hires;       /* 1 = 14-bit CC: `cc` is the MSB controller (0..31) and
+	                  * cc+32 carries the LSB, per the MIDI 1.0 pairing */
+	int smooth;      /* hires only: backlash in raw ADC counts that absorbs
+	                  * the converter's +-1 dither at rest (0 = none) */
 };
+
+#define RK3_HIRES_SMOOTH 1   /* default backlash for a hires pedal */
 
 struct rk3_cfg {
 	int channel;                          /* 0..15 (MIDI channel 1..16 minus 1) */
@@ -101,6 +107,8 @@ static void cfg_defaults(struct rk3_cfg *c)
 		c->axis[a].sw_cc  = RK3_CC_OFF;
 		c->axis[a].sw_on  = 5;
 		c->axis[a].sw_off = 3;
+		c->axis[a].hires  = 0;
+		c->axis[a].smooth = RK3_HIRES_SMOOTH;
 	}
 }
 
@@ -121,6 +129,8 @@ struct rk3_midi {
 
 	int     have_analog;
 	uint8_t analog_cc_val[RK3_N_ANALOG];   /* last sent 0..127 */
+	int     analog_val14[RK3_N_ANALOG];    /* hires: last sent 0..16383 */
+	int     analog_filt[RK3_N_ANALOG];     /* hires: backlash-filtered raw */
 	int     analog_raw[RK3_N_ANALOG];      /* last raw, for -v on-change print */
 	uint8_t analog_sw[RK3_N_ANALOG];       /* derived switch state 0/1 */
 
@@ -145,6 +155,22 @@ static void send_cc(struct rk3_midi *m, uint8_t cc, uint8_t val)
 	MIDIPacketList *list = (MIDIPacketList *)storage;
 	MIDIPacket *pkt = MIDIPacketListInit(list);
 	/* timestamp 0 => deliver now */
+	pkt = MIDIPacketListAdd(list, sizeof(storage), pkt, 0, sizeof(msg), msg);
+	if (pkt)
+		MIDIReceived(m->source, list);
+}
+
+/* 14-bit controller: MSB on `cc`, LSB on cc+32, sent together (MSB first) so a
+ * receiver never pairs a new MSB with a stale LSB. val is 0..16383. */
+static void send_cc14(struct rk3_midi *m, uint8_t cc, int val)
+{
+	Byte st = (Byte)(0xB0 | (m->cfg.channel & 0x0f));
+	Byte msg[6] = { st, (Byte)(cc & 0x7f), (Byte)((val >> 7) & 0x7f),
+			st, (Byte)((cc + 32) & 0x7f), (Byte)(val & 0x7f) };
+
+	Byte storage[64];
+	MIDIPacketList *list = (MIDIPacketList *)storage;
+	MIDIPacket *pkt = MIDIPacketListInit(list);
 	pkt = MIDIPacketListAdd(list, sizeof(storage), pkt, 0, sizeof(msg), msg);
 	if (pkt)
 		MIDIReceived(m->source, list);
@@ -322,13 +348,48 @@ static void handle_analog(struct rk3_midi *m, const uint8_t *p, int len,
 			continue;
 
 		int lo = ax->min, hi = ax->max, clamped = raw;
-		if (clamped < lo) clamped = lo;
-		if (clamped > hi) clamped = hi;
-		uint8_t val = (hi > lo)
-			? (uint8_t)((clamped - lo) * 127 / (hi - lo)) : 0;
+		uint8_t val;
 
-		/* continuous CC */
-		if (ax->cc != RK3_CC_OFF &&
+		if (ax->hires && ax->cc != RK3_CC_OFF) {
+			/*
+			 * 14-bit path. Every raw ADC count becomes its own value, so
+			 * the converter's dither at rest would chatter; a backlash of
+			 * `smooth` counts absorbs it without costing resolution while
+			 * the pedal moves (the output trails the input by `smooth`
+			 * counts in the direction of travel). The calibrated range is
+			 * narrowed by the same amount at each end so 0 and 16383 stay
+			 * reachable.
+			 */
+			int h = ax->smooth, f = m->have_analog ? m->analog_filt[a] : raw;
+			if (raw > f + h) f = raw - h;
+			else if (raw < f - h) f = raw + h;
+			m->analog_filt[a] = f;
+
+			int flo = lo + h, fhi = hi - h;
+			if (fhi <= flo) { flo = lo; fhi = hi; }
+			clamped = f;
+			if (clamped < flo) clamped = flo;
+			if (clamped > fhi) clamped = fhi;
+			int v14 = (fhi > flo)
+				? (int)((long)(clamped - flo) * 16383 / (fhi - flo)) : 0;
+			val = (uint8_t)(v14 >> 7);       /* 7-bit view for the switch */
+			if (!m->have_analog || v14 != m->analog_val14[a]) {
+				m->analog_val14[a] = v14;
+				m->analog_cc_val[a] = val;
+				send_cc14(m, (uint8_t)ax->cc, v14);
+				if (verbose)
+					printf("    analog%d -> CC%d/%d %d (14-bit)\n",
+					       a, ax->cc, ax->cc + 32, v14);
+			}
+		} else {
+			if (clamped < lo) clamped = lo;
+			if (clamped > hi) clamped = hi;
+			val = (hi > lo)
+				? (uint8_t)((clamped - lo) * 127 / (hi - lo)) : 0;
+		}
+
+		/* continuous CC (7-bit) */
+		if (!ax->hires && ax->cc != RK3_CC_OFF &&
 		    (!m->have_analog || val != m->analog_cc_val[a])) {
 			m->analog_cc_val[a] = val;
 			send_cc(m, (uint8_t)ax->cc, val);
@@ -527,6 +588,13 @@ int rk3_midi_load_config(struct rk3_midi *m, const char *path)
 				else if (strcasecmp(tok[i], "cc") == 0 &&
 					 !take_val(tok, n, &i, 0, 127, &v))
 					ax->cc = v;
+				else if (strcasecmp(tok[i], "hires") == 0)
+					ax->hires = 1;
+				else if (strcasecmp(tok[i], "lores") == 0)
+					ax->hires = 0;
+				else if (strcasecmp(tok[i], "smooth") == 0 &&
+					 !take_val(tok, n, &i, 0, 16, &v))
+					ax->smooth = v;
 				else if (strcasecmp(tok[i], "calibmin") == 0 &&
 					 !take_val(tok, n, &i, 0, 65535, &v))
 					ax->min = v;
@@ -575,6 +643,12 @@ int rk3_midi_load_config(struct rk3_midi *m, const char *path)
 			ax->max = d.axis[a].max;
 			errors++;
 		}
+		if (ax->hires && ax->cc != RK3_CC_OFF && ax->cc > 31) {
+			fprintf(stderr, "  %s: hires needs cc 0..31 (the LSB goes out "
+				"on cc+32); cc %d stays 7-bit\n", kAxisName[a], ax->cc);
+			ax->hires = 0;
+			errors++;
+		}
 		if (ax->sw_off > ax->sw_on) {
 			fprintf(stderr, "  %s: soff > son (%d > %d); clamping "
 				"soff to son\n", kAxisName[a], ax->sw_off, ax->sw_on);
@@ -609,6 +683,11 @@ static void fmt_pedal_line(char *buf, size_t n, const struct rk3_axis *ax,
 	else
 		k += snprintf(buf + k, n - k, " cc %d", ax->cc);
 	k += snprintf(buf + k, n - k, " calibMin %d calibMax %d", ax->min, ax->max);
+	if (ax->hires) {
+		k += snprintf(buf + k, n - k, " hires");
+		if (ax->smooth != RK3_HIRES_SMOOTH)
+			k += snprintf(buf + k, n - k, " smooth %d", ax->smooth);
+	}
 	if (ax->sw_cc != RK3_CC_OFF)
 		k += snprintf(buf + k, n - k, " switch %d son %d soff %d",
 			      ax->sw_cc, ax->sw_on, ax->sw_off);

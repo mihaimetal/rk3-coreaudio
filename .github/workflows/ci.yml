@@ -22,7 +22,7 @@ jobs:
         run: make midihelper
 
       - name: Build diagnostic tools
-        run: make all
+        run: make all enginetest enginetest-ll iotest
 
       - name: Verify driver bundle signature
         run: codesign -vv build/RigKontrol3.driver

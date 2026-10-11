@@ -1,3 +1,10 @@
+> **Superseded (2026-10).** The premises below did not hold up on macOS 26:
+> ~1000 isoc completions/s is *not* a hard ceiling — 1000, 1500 and 2000/s all run
+> clean inside the driver process — and the shipped geometry is now 1 ms transfers
+> (see `RK3_DEFAULT_*` in `rk3_engine.h` and *Latency tuning* in the README).
+> The fill setpoint and capture floor described here have changed meaning (they
+> are now the ring *trough* and the post-read *margin*). Kept for the history.
+
 # RK3 CoreAudio — LATENCY HANDOFF #2 (for a fresh agent after /clear)
 
 **Your one job:** squeeze more round-trip / monitoring latency out of the RigKontrol 3

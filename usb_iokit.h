@@ -41,7 +41,16 @@ struct rk3_usb {
 
 	uint16_t iso_in_maxpacket;
 	uint16_t iso_out_maxpacket;
+
+	uint64_t entry_id;      /* IORegistry entry ID of the device we opened */
 };
+
+/*
+ * 1 while the device instance this handle was opened on is still attached.
+ * A re-plugged RK3 is a NEW registry entry, so this goes to 0 on unplug and
+ * stays 0 — the caller must close and reopen. Cheap; safe from any thread.
+ */
+int rk3_usb_present(const struct rk3_usb *u);
 
 /*
  * Find, open, configure the RK3 and open interface #0 at alt 1.

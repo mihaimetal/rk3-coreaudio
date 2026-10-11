@@ -24,8 +24,8 @@ ENGINE_SRC := usb_iokit.c caiaq_protocol.c codec_mode2.c rk3_engine.c
 .PHONY: all usbprobe handshake codectest stream epdump test clean \
         sandboxprobe install-probe uninstall-probe probe-log \
         midiprobe install-midi-probe uninstall-midi-probe midi-probe-log \
-        driver install-driver uninstall-driver driver-log rk3midi rk3led \
-        rk3monitor install uninstall \
+        driver install-driver reload-driver uninstall-driver driver-log rk3midi rk3led \
+        rk3monitor install uninstall enginetest enginetest-ll \
         midihelper install-midihelper uninstall-midihelper midihelper-log
 
 all: usbprobe handshake codectest stream epdump
@@ -40,9 +40,14 @@ $(BUILD)/stream: tools/stream.c $(STREAM_SRC) usb_iokit.h caiaq_protocol.h codec
 	$(CC) $(CFLAGS) tools/stream.c $(STREAM_SRC) $(FRAMEWORKS) -o $@
 	@echo "Built $@ — run ./build/stream <seconds> [--play] with the RK3 plugged in."
 
-# Codec unit test — no hardware required.
-test: $(BUILD)/codectest
+# Unit tests — no hardware required.
+test: $(BUILD)/codectest $(BUILD)/miditest
 	./$(BUILD)/codectest
+	./$(BUILD)/miditest
+
+$(BUILD)/miditest: tools/miditest.c rk3_midi.c rk3_midi.h caiaq_protocol.h | $(BUILD)
+	$(CC) $(CFLAGS) -Wno-unused-function tools/miditest.c \
+		$(FRAMEWORKS) -framework CoreMIDI -o $@
 
 $(BUILD)/codectest: tools/codectest.c codec_mode2.c codec_mode2.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/codectest.c codec_mode2.c -o $@
@@ -106,8 +111,9 @@ $(BUILD)/rk3midihelper: tools/rk3midihelper.c rk3_midi.c \
 # chowned back to that user so a sudo run doesn't leave it root-owned.
 install-midihelper: $(BUILD)/rk3midihelper
 	sudo cp $(BUILD)/rk3midihelper /usr/local/bin/rk3midihelper
-	sudo cp tools/rk3-reload-config tools/rk3-calibrate /usr/local/bin/
-	sudo chmod +x /usr/local/bin/rk3-reload-config /usr/local/bin/rk3-calibrate
+	sudo cp tools/rk3-reload-config tools/rk3-calibrate tools/rk3-tune /usr/local/bin/
+	sudo chmod +x /usr/local/bin/rk3-reload-config /usr/local/bin/rk3-calibrate \
+		/usr/local/bin/rk3-tune
 	mkdir -p $(HOME)/Library/LaunchAgents
 	cp $(HELPER_PLIST) $(HELPER_AGENT)
 	@uid=$${SUDO_UID:-$$(id -u)}; gid=$${SUDO_GID:-$$(id -g)}; \
@@ -122,15 +128,37 @@ uninstall-midihelper:
 	launchctl bootout gui/$$uid $(HELPER_AGENT) 2>/dev/null || true
 	rm -f $(HELPER_AGENT)
 	sudo rm -f /usr/local/bin/rk3midihelper
-	sudo rm -f /usr/local/bin/rk3-reload-config /usr/local/bin/rk3-calibrate
+	sudo rm -f /usr/local/bin/rk3-reload-config /usr/local/bin/rk3-calibrate \
+		/usr/local/bin/rk3-tune
 	@echo "Uninstalled MIDI helper."
 
 midihelper-log:
 	@tail -n 50 /tmp/rk3midihelper.log 2>/dev/null || echo "(no log yet)"
 
+# Watch the "RigKontrol 3" MIDI source and summarise a pedal's CC stream
+# (message rate, distinct values, 7-bit vs 14-bit). ./build/midimon [secs] [cc]
+midimon: $(BUILD)/midimon
+$(BUILD)/midimon: tools/midimon.c | $(BUILD)
+	$(CC) $(CFLAGS) tools/midimon.c $(FRAMEWORKS) -framework CoreMIDI -o $@
+
 # Config-descriptor / isoc endpoint sync-type dump (no audio).
 $(BUILD)/epdump: tools/epdump.c usb_iokit.c usb_iokit.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/epdump.c usb_iokit.c $(FRAMEWORKS) -o $@
+
+# Runs the real engine in an ordinary process (device must be free: uninstall the
+# driver first). Proves a transport geometry outside coreaudiod; see the file header.
+enginetest: $(BUILD)/enginetest
+$(BUILD)/enginetest: tools/enginetest.c $(ENGINE_SRC) rk3_engine.h usb_iokit.h \
+		caiaq_protocol.h codec_mode2.h | $(BUILD)
+	$(CC) $(CFLAGS) -DRK3_TEST_HOOKS tools/enginetest.c $(ENGINE_SRC) \
+		$(FRAMEWORKS) -o $@
+
+# Same harness on the LowLatency isoch API (kernel-shared, pre-wired buffers).
+enginetest-ll: $(BUILD)/enginetest-ll
+$(BUILD)/enginetest-ll: tools/enginetest.c $(ENGINE_SRC) rk3_engine.h usb_iokit.h \
+		caiaq_protocol.h codec_mode2.h | $(BUILD)
+	$(CC) $(CFLAGS) -DRK3_TEST_HOOKS -DRK3_USE_LOWLAT=1 tools/enginetest.c \
+		$(ENGINE_SRC) $(FRAMEWORKS) -o $@
 
 # Exercises the installed RigKontrol3.driver (AUHAL bound to our device by UID).
 iotest: $(BUILD)/iotest
@@ -232,6 +260,21 @@ install-driver: $(DRIVER_BUNDLE)
 	@echo "Installed to $(HAL_DIR). Restarting coreaudiod..."
 	sudo killall coreaudiod || true
 	@echo "Wait ~3s, then check Audio MIDI Setup / 'make driver-log'."
+
+# Replace the installed driver WITHOUT restarting coreaudiod: on macOS versions
+# that host each HAL plugin in its own "Core Audio Driver (<name>.driver)" process,
+# killing just that process makes coreaudiod relaunch it from the new bundle. Use
+# this when a full coreaudiod restart is disruptive (every audio client on the
+# machine re-enumerates). If the device does not come back within ~10 s, fall
+# back to `sudo killall coreaudiod`.
+reload-driver: $(DRIVER_BUNDLE)
+	sudo rm -rf $(HAL_DIR)/RigKontrol3.driver
+	sudo cp -R $(DRIVER_BUNDLE) $(HAL_DIR)/
+	sudo codesign --force --sign - $(HAL_DIR)/RigKontrol3.driver
+	# SIGKILL: the driver host ignores a plain SIGTERM (it kept running the old
+	# code after the bundle was replaced underneath it).
+	sudo pkill -9 -f 'Core Audio Driver \(RigKontrol3' || true
+	@echo "Driver process restarted; coreaudiod left running."
 
 uninstall-driver:
 	sudo rm -rf $(HAL_DIR)/RigKontrol3.driver

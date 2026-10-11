@@ -1,0 +1,13 @@
+#!/bin/bash
+#
+# rk3-tune <in_fpx> <out_fpx> <n_out> [trough48] [floor48]
+#
+# Queue new transport geometry / fill targets on the running RigKontrol 3 driver
+# (0 = leave unchanged). Takes effect at the next audio start, so stop and
+# restart the audio client. Not persistent: a coreaudiod restart restores the
+# compiled defaults. See rk3_engine_set_tuning in rk3_engine.h for the limits.
+#
+# Requires bash (uses /dev/udp).
+
+[ $# -ge 3 ] || { echo "usage: $(basename "$0") <in_fpx> <out_fpx> <n_out> [trough48] [floor48]" >&2; exit 1; }
+printf 'TUNE %d %d %d %d %d' "$1" "$2" "$3" "${4:-0}" "${5:-0}" > /dev/udp/127.0.0.1/17891

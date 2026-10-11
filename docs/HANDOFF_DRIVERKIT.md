@@ -1,3 +1,7 @@
+> **Context changed (2026-10).** The premise that userspace cannot go below
+> ~14 ms did not hold: the HAL plugin now measures ~8-10 ms loopback with 1 ms
+> transfers (README, *Latency tuning*). The DriverKit notes are kept for reference.
+
 # HANDOFF — DriverKit dext path (sub-10 ms round-trip)
 
 Date: 2026-06-22. Author: prior agent. Read this top-to-bottom before touching code.

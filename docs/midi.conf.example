@@ -59,8 +59,19 @@ button 9 = cc 28
 #                        127 when value >= son, 0 when value < soff. The son/soff
 #                        gap is hysteresis so it doesn't chatter at the edge.
 #   son V / soff V       switch on/off thresholds in 0..127 (default 5 / 3)
+#   hires                14-bit CC: the full pedal resolution instead of 128
+#                        steps. `cc` becomes the MSB controller and must be
+#                        0..31; the LSB goes out on cc+32 (CC11 -> CC43). The
+#                        built-in treadle has ~230 positions over its travel,
+#                        the rear jacks 1024. The receiver must be set to read
+#                        14-bit CC, otherwise it just sees the MSB (128 steps).
+#   smooth N             hires only: backlash in raw ADC counts (default 1) that
+#                        stops the value chattering when the pedal is at rest.
+#                        Raise it if a held pedal still flickers; 0 turns it off.
 pedal treadle = cc 11 calibMin 40 calibMax 270
 pedal exp1    = cc 12 calibMin 0  calibMax 1023
 pedal exp2    = cc 13 calibMin 0  calibMax 1023
+# Example — 14-bit treadle on CC11 (MSB) + CC43 (LSB):
+# pedal treadle = cc 11 calibMin 40 calibMax 270 hires
 # Example — treadle sweeps CC11 AND turns CC9 on once you push off the heel:
 # pedal treadle = cc 11 calibMin 40 calibMax 270 switch 9 son 5 soff 3

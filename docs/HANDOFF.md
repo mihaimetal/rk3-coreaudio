@@ -1,3 +1,9 @@
+> **Historical (updated 2026-10).** This is the original bring-up log. Since
+> then: 1 ms transfers are the default, the fill "setpoint"/"floor" constants
+> changed meaning, the `ClearPipeStallBothEnds` before `AUDIO_PARAMS` was removed
+> (it caused the retries described here), and the capture grace period was fixed.
+> See the README's *Latency tuning* and the comments in `rk3_engine.h`.
+
 # RK3 CoreAudio — Handoff
 
 Porting the Native Instruments **RigKontrol 3** (VID `0x17cc` / PID `0x1940`,

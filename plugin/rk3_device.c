@@ -82,8 +82,18 @@ static const Float64 kSupportedRates[] = { 44100.0, 48000.0, 96000.0, 192000.0 }
  * the sawtooth, short enough to track the startup transient and balloons.
  * gain 2.0 + alpha 0.15 overshot the startup drain and crushed the troughs to ~10
  * (→ 19 underruns); 0.75 + 0.10 is gentler and calmer.
+ *
+ * 0.10 -> 0.40 with the trough servo. At the ~6 Hz update rate the loop is
+ *   fill[k+1] = fill[k] - G*T*(avg[k] - setpoint),  avg += alpha*(fill - avg)
+ * with G*T = 0.128. alpha = 0.10 puts its poles at |z| = 0.955, angle 0.105 rad:
+ * a ~10 s ring that decays over ~4 s — exactly the slow +-20-frame swing seen in
+ * the clk: log, which overshot to an empty ring at stream start (2-3 playback
+ * underruns) and then, swinging back, pulled the capture ring down to zero margin
+ * (4-6 capture underruns). alpha = 0.40 gives |z| = 0.81 (settles in ~1 s, no
+ * ring). The trough is a per-period minimum, already free of the sawtooth the
+ * old mean-fill EMA had to average out, so it does not need the heavy smoothing.
  */
-#define kFillServoAlpha    0.10
+#define kFillServoAlpha    0.40
 
 /* ---- driver state ---------------------------------------------------- */
 
@@ -248,7 +258,10 @@ static void *engine_supervisor(void *arg)
 		pthread_mutex_lock(&gStateMutex);
 		if (!gEngineOpen) {
 			engine_open_locked();          /* quietly retry if it fails */
-		} else if (gIOCount == 0 && rk3_engine_usb_dead(&gEngine)) {
+		} else if (gIOCount == 0 && (rk3_engine_usb_dead(&gEngine) ||
+					     !rk3_engine_present(&gEngine))) {
+			/* usb_dead needs a completion to report NoDevice; the registry
+			 * check also catches an unplug that only ever reported Aborted. */
 			DLOG("supervisor: device gone — closing engine; reopen on attach");
 			rk3_engine_close(&gEngine);
 			gEngineOpen = 0;
@@ -680,28 +693,17 @@ static OSStatus Drv_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 		 * Honest presentation latency the host (Reaper PDC + display) can
 		 * see. CoreAudio adds buffer + SafetyOffset on top. Reported once,
 		 * on the device object (scope-aware); streams return 0 so the host
-		 * does not double-count. One isoc transfer = FRAMES_PER_XFER
-		 * microframes of audio (8 microframes = 1 ms => * rate/8000); OUT
-		 * and IN now use different transfer sizes (RK3_OUT_FRAMES_PER_XFER
-		 * vs RK3_FRAMES_PER_XFER), so account for them separately.
+		 * does not double-count.
 		 */
 		UInt32 frames = 0;
 		if (o == kObjID_Device) {
-			if (a->mScope == kAudioObjectPropertyScopeOutput) {
-				UInt32 outXfer = (UInt32)(RK3_OUT_FRAMES_PER_XFER
-						* (gSampleRate / 8000.0));
-				/* servo-held standing OUT-ring fill (steady state =
-				 * setpoint, NOT the initial-only cushion) + the
-				 * N_OUT_XFERS-deep isoc pipeline (each refilled buffer
-				 * is rescheduled N_OUT_XFERS * stride ahead before it is
-				 * heard). The setpoint is rate-scaled by the engine. */
-				frames = rk3_engine_out_fill_setpoint(&gEngine)
-				       + RK3_N_OUT_XFERS * outXfer;
-			} else {
-				/* one capture transfer before samples surface */
-				frames = (UInt32)(RK3_FRAMES_PER_XFER
-						* (gSampleRate / 8000.0));
-			}
+			/* OUT: servo-held standing ring fill + the in-flight isoc
+			 * pipeline. IN: one capture transfer before samples surface.
+			 * Both follow the engine's live transport geometry. */
+			if (a->mScope == kAudioObjectPropertyScopeOutput)
+				frames = (UInt32)rk3_engine_out_latency_frames(&gEngine);
+			else
+				frames = (UInt32)rk3_engine_in_latency_frames(&gEngine);
 		}
 		*outSize = sizeof(UInt32); *(UInt32 *)out = frames; return 0;
 	}
@@ -978,14 +980,15 @@ static OSStatus Drv_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
 
 		/*
 		 * Fill servo (runs once per period, ~6 Hz): trim the perceived device
-		 * rate so the OUT-ring standing fill converges to RK3_OUT_FILL_SETPOINT.
-		 * fill < 0 = playout not started yet, leave the trim unchanged. A positive
+		 * rate so the OUT ring's TROUGH (its lowest fill in the period just
+		 * ended) converges to RK3_OUT_FILL_SETPOINT. No sample (playout not
+		 * started yet) leaves the trim unchanged. A positive
 		 * fill error (ring too full) slows the perceived rate so CoreAudio
 		 * produces a touch slower and the device drains the excess; negative
 		 * speeds it up. Click-free: nothing is resampled, the ring just settles.
 		 */
-		int fill = rk3_engine_out_fill_frames(&gEngine);
-		if (fill >= 0) {
+		int fill;   /* the ring's trough over the last period, not its mean */
+		if (rk3_engine_out_trough(&gEngine, &fill)) {
 			/*
 			 * EMA-smooth the noisy sawtooth fill before acting on it.
 			 * SOFT-START: seed the EMA to the SETPOINT, not to the first
@@ -1012,7 +1015,7 @@ static OSStatus Drv_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
 			static unsigned servo_ctr;
 			if (++servo_ctr >= 6) {   /* ~once/sec */
 				servo_ctr = 0;
-				DLOG("servo: fill=%d avg=%.0f setpoint=%d trim=%+.4f%%",
+				DLOG("servo: trough=%d avg=%.0f setpoint=%d trim=%+.4f%%",
 				     fill, gFillAvg, setpoint,
 				     gServoTrim * 100.0);
 			}

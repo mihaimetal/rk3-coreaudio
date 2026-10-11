@@ -9,7 +9,8 @@ echo "==> Unloading + removing MIDI helper"
 uid="${SUDO_UID:-$(id -u)}"
 launchctl bootout "gui/$uid" "$AGENT_DST" 2>/dev/null || true
 rm -f "$AGENT_DST"
-sudo rm -f /usr/local/bin/rk3midihelper
+sudo rm -f /usr/local/bin/rk3midihelper /usr/local/bin/rk3-reload-config \
+	/usr/local/bin/rk3-calibrate /usr/local/bin/rk3-tune
 
 echo "==> Removing driver (sudo)"
 sudo rm -rf "$HAL_DIR/RigKontrol3.driver"

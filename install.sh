@@ -29,7 +29,15 @@ sudo codesign --force --sign - "$HAL_DIR/$DRIVER"
 
 if [ -f "$HELPER_BIN" ]; then
 	echo "==> Installing MIDI helper + LaunchAgent"
+	sudo mkdir -p /usr/local/bin
 	sudo cp "$HELPER_BIN" /usr/local/bin/rk3midihelper
+	# companion scripts: reload the MIDI mapping, calibrate a pedal, tune latency
+	for t in rk3-reload-config rk3-calibrate rk3-tune; do
+		if [ -f "$t" ]; then
+			sudo cp "$t" "/usr/local/bin/$t"
+			sudo chmod +x "/usr/local/bin/$t"
+		fi
+	done
 	mkdir -p "$HOME/Library/LaunchAgents"
 	cp "$AGENT_PLIST" "$AGENT_DST"
 	# A LaunchAgent loads in the user's GUI domain, not root's. Resolve the real
@@ -45,8 +53,19 @@ if [ -f "$HELPER_BIN" ]; then
 		     "launchctl bootstrap gui/$uid $AGENT_DST"
 fi
 
-echo "==> Restarting coreaudiod"
-sudo killall coreaudiod 2>/dev/null || true
+# An UPGRADE only needs the driver's own host process restarted: recent macOS
+# runs each HAL plugin in a "Core Audio Driver (<name>.driver)" process, and
+# coreaudiod relaunches it from the new bundle when it is killed (SIGKILL — it
+# ignores SIGTERM). That avoids restarting coreaudiod, which makes every audio
+# client on the machine re-enumerate. A FIRST install has no such process yet, so
+# coreaudiod itself must restart to discover the plugin.
+if pgrep -f 'Core Audio Driver \(RigKontrol3' >/dev/null 2>&1; then
+	echo "==> Restarting the RigKontrol 3 driver process (coreaudiod keeps running)"
+	sudo pkill -9 -f 'Core Audio Driver \(RigKontrol3' || true
+else
+	echo "==> Restarting coreaudiod (first install)"
+	sudo killall coreaudiod 2>/dev/null || true
+fi
 
 echo
 echo "Done. Plug in the RigKontrol 3 and check Audio MIDI Setup."

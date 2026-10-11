@@ -144,6 +144,7 @@ int rk3_usb_open(struct rk3_usb *u)
 		return -1;
 	}
 
+	IORegistryEntryGetRegistryEntryID(svc, &u->entry_id);
 	u->dev = open_device(svc);
 	IOObjectRelease(svc);
 	if (!u->dev) {
@@ -213,6 +214,20 @@ void rk3_usb_close(struct rk3_usb *u)
 		(*u->dev)->Release(u->dev);
 		u->dev = NULL;
 	}
+	u->entry_id = 0;
+}
+
+int rk3_usb_present(const struct rk3_usb *u)
+{
+	if (!u->entry_id)
+		return 0;
+	/* IORegistryEntryIDMatching's dictionary is consumed by the call. */
+	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+			IORegistryEntryIDMatching(u->entry_id));
+	if (!svc)
+		return 0;
+	IOObjectRelease(svc);
+	return 1;
 }
 
 void rk3_clear_stall(struct rk3_usb *u, uint8_t pipe)

@@ -1,5 +1,6 @@
 /* caiaq_protocol.c — see caiaq_protocol.h */
 
+#include <mach/mach_time.h>
 #include "caiaq_protocol.h"
 
 #include <stdio.h>
@@ -31,14 +32,34 @@ int caiaq_send_command(struct rk3_usb *u, uint8_t command,
  * out of attempts. The device may interleave unsolicited messages (MIDI,
  * analog/ERP) once auto-messages are on, so we filter by command byte.
  */
+#define REPLY_WINDOW_MS 250
+
+static uint64_t now_ms(void)
+{
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) mach_timebase_info(&tb);
+	return mach_absolute_time() * tb.numer / tb.denom / 1000000ull;
+}
+
 static int read_reply(struct rk3_usb *u, uint8_t want_cmd,
 		      uint8_t *buf, size_t cap, size_t *out_len)
 {
-	for (int attempt = 0; attempt < 16; attempt++) {
+	/*
+	 * Bounded by TIME, not by packet count. The device answers a command in
+	 * ~15 ms (measured, incl. AUDIO_PARAMS across every rate change), but it
+	 * also sends unsolicited 0x03 control reports on this pipe whenever a pedal
+	 * ADC flickers; counting packets let a trickle of those either end the wait
+	 * early or stretch it to many seconds. REPLY_WINDOW_MS is the whole budget.
+	 */
+	uint64_t deadline = now_ms() + REPLY_WINDOW_MS;
+	for (;;) {
+		uint64_t now = now_ms();
+		if (now >= deadline)
+			return -1;
 		size_t len = cap;
-		int rc = rk3_bulk_read(u, buf, &len, 500);
+		int rc = rk3_bulk_read(u, buf, &len, (unsigned)(deadline - now));
 		if (rc == RK3_ETIMEOUT)
-			return -1; /* device went quiet */
+			return -1; /* no reply inside the window */
 		if (rc != 0)
 			return -1;
 		if (len >= 1 && buf[0] == want_cmd) {
@@ -47,7 +68,6 @@ static int read_reply(struct rk3_usb *u, uint8_t want_cmd,
 		}
 		/* else: unsolicited message, keep reading */
 	}
-	return -1;
 }
 
 int caiaq_get_device_info(struct rk3_usb *u, struct caiaq_device_spec *spec)
@@ -56,11 +76,23 @@ int caiaq_get_device_info(struct rk3_usb *u, struct caiaq_device_spec *spec)
 	size_t len = 0;
 	int rc;
 
-	rc = caiaq_send_command(u, EP1_CMD_GET_DEVICE_INFO, NULL, 0);
-	if (rc != 0)
-		return rc;
-
-	rc = read_reply(u, EP1_CMD_GET_DEVICE_INFO, buf, sizeof(buf), &len);
+	/*
+	 * Ask up to three times. The RK3 does not reset its EP 0x81 data toggle when
+	 * the host does (see the note in rk3_engine_audio_start), and re-opening the
+	 * interface after another owner used it resets the host's. When the two
+	 * disagree the host silently discards exactly one packet — the reply to the
+	 * first command — after which they agree again and the second request is
+	 * answered. Measured: first request after such a re-open 0/1, the next
+	 * 20/20. Without the retry that state needed a physical replug.
+	 */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		rc = caiaq_send_command(u, EP1_CMD_GET_DEVICE_INFO, NULL, 0);
+		if (rc != 0)
+			return rc;
+		rc = read_reply(u, EP1_CMD_GET_DEVICE_INFO, buf, sizeof(buf), &len);
+		if (rc == 0)
+			break;
+	}
 	if (rc != 0) {
 		fprintf(stderr, "caiaq_get_device_info: no reply\n");
 		return -1;

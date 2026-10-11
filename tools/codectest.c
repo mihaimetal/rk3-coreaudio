@@ -76,6 +76,41 @@ static void test_capture_panic(void)
 
 	caiaq_capture_mode2(&c, usb, BPP, pcm, &pos, sizeof(pcm));
 	CHECK(c.input_panic == 1, "corrupted check byte raises input_panic");
+	CHECK(c.input_errs == 1, "and counts one bad packet");
+	int silent = 1;
+	for (int k = 0; k < pos; k++) if (pcm[k]) silent = 0;
+	CHECK(silent, "the bad packet is delivered as silence");
+
+	/* the mute must NOT latch: the next good packet decodes normally */
+	build_capture_packet(usb, BPP);
+	int start = pos, nonzero = 0;
+	caiaq_capture_mode2(&c, usb, BPP, pcm, &pos, sizeof(pcm));
+	for (int k = start; k < pos; k++) if (pcm[k]) nonzero = 1;
+	CHECK(nonzero, "a good packet after a bad one is not muted");
+	CHECK(c.input_errs == 1, "and is not counted");
+}
+
+static void test_capture_grace(void)
+{
+	printf("test_capture_grace\n");
+	uint8_t usb[BPP], pcm[65536];
+	int pos = 0;
+	struct caiaq_codec c;
+	caiaq_codec_reset(&c);
+
+	/* bad packets inside the start-up grace are muted but not flagged, and the
+	 * grace is counted in packets, not bytes */
+	for (int n = 0; n < CAIAQ_GRACE_PACKETS; n++) {
+		build_capture_packet(usb, BPP);
+		usb[4] ^= 0x01;
+		caiaq_capture_mode2(&c, usb, BPP, pcm, &pos, sizeof(pcm));
+	}
+	CHECK(c.input_panic == 0 && c.input_errs == 0,
+	      "bad packets during the grace period do not raise input_panic");
+	build_capture_packet(usb, BPP);
+	usb[4] ^= 0x01;
+	caiaq_capture_mode2(&c, usb, BPP, pcm, &pos, sizeof(pcm));
+	CHECK(c.input_panic == 1, "the first bad packet after the grace does");
 }
 
 static void test_playback_layout(void)
@@ -115,6 +150,7 @@ int main(void)
 	printf("=== mode-2 codec unit tests ===\n");
 	test_capture_roundtrip();
 	test_capture_panic();
+	test_capture_grace();
 	test_playback_layout();
 
 	if (failures == 0)

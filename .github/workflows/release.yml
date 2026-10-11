@@ -27,8 +27,11 @@ jobs:
           cp -R build/RigKontrol3.driver "$STAGE/"
           cp build/rk3midihelper "$STAGE/"
           cp launchd/com.mihai.rk3.midihelper.plist "$STAGE/"
+          cp tools/rk3-reload-config tools/rk3-calibrate tools/rk3-tune "$STAGE/"
+          mkdir -p "$STAGE/docs"
+          cp docs/midi.conf.example "$STAGE/docs/"
           cp install.sh uninstall.sh README.md LICENSE "$STAGE/"
-          chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
+          chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh" "$STAGE"/rk3-*
           # ditto preserves the .driver bundle structure + code signature.
           ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$STAGE.zip"
 

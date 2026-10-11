@@ -15,10 +15,11 @@ helper, so the RK3 works as a normal sound card and MIDI foot controller again.
 What you get:
 
 - **2-in / 2-out USB audio** at 44.1 / 48 / 96 / 192 kHz, switchable live in
-  Audio MIDI Setup. Appears as a standard CoreAudio device usable by Reaper,
+  Audio MIDI Setup (all four verified with an analog loopback). Appears as a standard CoreAudio device usable by Reaper,
   the system, or any audio app.
-- **Round-trip latency** — ~12–15 ms loopback at 48 kHz / 64-frame buffer. This
-  is **not yet low and needs improvement** (see `docs/HANDOFF_LATENCY2.md`).
+- **Round-trip latency** — ~10 ms analog loopback at 48 kHz / 64-frame buffer
+  and ~8 ms at 96 / 192 kHz (was ~12–13 ms at 48 kHz), using 1 ms USB transfers
+  and margins that adapt to the host. See *Latency tuning* below.
 - **MIDI foot controls** — the 9 foot buttons and the pedals are published as a
   CoreMIDI source named **"RigKontrol 3"** (buttons → CC20–28; built-in treadle →
   CC11; the two rear expression-pedal jacks → CC12 / CC13). Always on; works with
@@ -29,6 +30,9 @@ What you get:
   decimal point blinks on the beat (`Con` → `Con.`), aligned to the transport's
   Start/Continue and cleared on Stop.
 - **LED / 7-segment control** over a loopback socket (see `tools/rk3led`).
+- **Power-on animation** — when the driver claims the device, `rig kontrol 3`
+  scrolls across the display with an LED chase, a counter races from 000 to 999
+  with the LEDs as a bar graph, a segment spinner runs, and it settles on `Con`.
 
 > **Unofficial / unaffiliated.** "RigKontrol" and "Native Instruments" are
 > trademarks of Native Instruments GmbH. This project is an independent,
@@ -61,8 +65,10 @@ What you get:
    - strip the `com.apple.quarantine` attribute,
    - copy `RigKontrol3.driver` to `/Library/Audio/Plug-Ins/HAL/`,
    - re-sign it in place (required — see note below),
-   - install the MIDI helper to `/usr/local/bin` + a per-user LaunchAgent,
-   - restart `coreaudiod`.
+   - install the MIDI helper and the `rk3-*` companion scripts to
+     `/usr/local/bin` + a per-user LaunchAgent,
+   - restart `coreaudiod` on a first install, or only the driver's own host
+     process on an upgrade.
 
 3. Plug in the RigKontrol 3. It should appear in **Audio MIDI Setup** as a
    2-in/2-out device, the display should read `CON`, and a **"RigKontrol 3"**
@@ -92,11 +98,13 @@ Useful targets (see the `Makefile` for the full list):
 | --- | --- |
 | `make driver` / `sudo make install-driver` | build / install the audio driver |
 | `make midihelper` / `sudo make install-midihelper` | build / install the CoreMIDI helper |
+| `sudo make reload-driver` | install the driver and restart only its own host process (no `coreaudiod` restart) |
 | `make uninstall-driver`, `uninstall-midihelper` | remove them |
+| `make enginetest` | build the engine test harness (runs the engine outside `coreaudiod`; needs the driver uninstalled) |
 | `make driver-log`, `midihelper-log` | tail the live os_log / helper log |
 | `make all` | build the hardware probe/diagnostic tools |
 | `make iotest` | build the loopback audio test tool |
-| `make test` | run the codec unit test (no hardware) |
+| `make test` | run the codec and MIDI-scaling unit tests (no hardware) |
 
 ## MIDI mapping config
 
@@ -122,7 +130,12 @@ lines are logged (`make midihelper-log`) and skipped. The file lets you set:
   tap vs hold fire different CCs, mutually exclusive), or `off`.
 - **Per-pedal mapping** for `treadle` / `exp1` / `exp2`: continuous `cc`, raw-ADC
   `calibMin`/`calibMax`, and an optional derived on/off `switch` CC with
-  `son`/`soff` hysteresis thresholds.
+  `son`/`soff` hysteresis thresholds. The pedals are read as 10-bit values
+  (0–1023; the built-in treadle only swings about 40–270) and sent as ordinary
+  7-bit CCs by default. Add `hires` to a pedal line to send 14-bit CC instead
+  (MSB on `cc`, which must be 0–31, LSB on `cc`+32): about 230 steps for the
+  treadle and 1024 for the rear jacks, if the receiving software reads 14-bit
+  CC.
 
 Calibrate a pedal's travel with `rk3-calibrate <1|2|3>` (1 = treadle, 2 = EXP1,
 3 = EXP2): it asks the running helper to capture the raw min/max while you sweep
@@ -131,6 +144,52 @@ live. See `docs/midi.conf.example` for the full annotated syntax.
 
 (`rk3-reload-config` and `rk3-calibrate` are installed to `/usr/local/bin` by
 `make install-midihelper`.)
+
+## Latency tuning
+
+The driver ships with 1 ms isochronous transfers in both directions (2000 USB
+completions per second). Measured with `./build/iotest 22 --latency` (cable from
+an RK3 output to an RK3 input) on macOS 26 / Apple Silicon, idle machine, settled
+round trip in ms:
+
+| Host buffer | 44.1 kHz | 48 kHz | 96 kHz | 192 kHz |
+| --- | --- | --- | --- | --- |
+| 64 frames | 10.3 | 10.0 | 8.0 | 8.4 |
+| 128 frames | 10.5 | 11.1 | 8.6 | 7.8 |
+| 256 frames | 14.6 | 13.9 | 9.8 | 9.9 |
+| 512 frames | 20.4 | 18.6 | 12.3 | 10.5 |
+
+No underruns, rejected-packet mutes or handshake retries in any of the 16 runs.
+About half of them include one extra output transfer in flight (+1 ms), added
+by the driver after a rejected USB submit — see below.
+
+Those are the driver's tightest margins, measured against an idle test client.
+Under a loaded DAW the driver widens them by itself: a playback or capture
+underrun adds about a millisecond (plus the shortfall) to that ring's margin, a
+rejected USB submit adds one transfer to the output pipeline, and the extra is
+given back slowly once the stream has been quiet. Expect the round trip to
+settle a few milliseconds higher in a heavy session; the current extras show as
+`margin=+out/+capture` in the `clk:` log line.
+
+The small transfers cost CPU in the driver's own process (roughly 20–40 % of one
+core while streaming, versus ~14 % with the previous 4 ms / 2 ms transfers).
+`rk3-tune` (in `tools/`, installed to `/usr/local/bin`) changes the geometry and the ring margins on the running driver
+— it takes effect the next time an app starts audio, and is not persistent:
+
+```sh
+tools/rk3-tune 16 8 3        # 2 ms in / 1 ms out: ~1 ms more latency, less CPU
+tools/rk3-tune 32 16 2       # the previous geometry
+tools/rk3-tune 8 8 3 48 48   # tighter ring margins (may click under load)
+```
+
+Arguments are `<in_fpx> <out_fpx> <n_out> [out-ring trough] [capture margin]`
+(microframes per transfer, transfers in flight, frames at 48 kHz). `make
+driver-log` shows a `clk:` line per second with the ring troughs, underrun
+counts and USB error counters; a `BREAKER TRIPPED` line means the engine stopped
+a runaway completion loop and will restart the stream by itself.
+
+To try a geometry outside `coreaudiod` first, uninstall the driver and run
+`make enginetest && ./build/enginetest 20 --in-fpx 8 --out-fpx 8 --n-out 3`.
 
 ### Why the in-place re-sign matters
 
@@ -146,7 +205,16 @@ that ordering if you script your own install.
 - **Device doesn't appear / no audio:** `make driver-log` and look for USB claim
   or codesign errors. Unplug/replug the RK3 if the interface got wedged.
 - **`coreaudiod` pegged at 100% CPU:** quit audio apps and reboot; never
-  `killall coreaudiod` or replug the device mid-stream while it's wedged.
+  `killall coreaudiod` or replug the device mid-stream while it's wedged. On
+  macOS 26 each HAL plugin runs in its own `Core Audio Driver (…)` process, so
+  check which process is actually busy: a restart of `coreaudiod` can also set
+  off a re-enumeration storm among the machine's other audio clients that has
+  nothing to do with this driver (seen with the driver uninstalled).
+  `sudo make reload-driver` updates the driver without restarting `coreaudiod`.
+- **Capture is silent after switching sample rate (older builds):** fixed — the
+  first packets after a rate change carry bad check bytes and used to mute
+  capture for the whole session. `chk_errs` in the `clk:` log line counts any
+  packet muted for that reason after start-up.
 - **No MIDI:** confirm the helper is running (`make midihelper-log`), and that
   the "RigKontrol 3" source is enabled in your DAW. MIDI works with or without
   an active audio stream.

@@ -8,6 +8,10 @@
  *   ./build/iotest [seconds] [--in]
  *      default: play a 440 Hz tone out the RK3 for `seconds` (listen on RK3 out).
  *      --in:    also capture from the RK3 and write iotest_cap.wav.
+ *      --rate N:  switch the device to N Hz first (default: its current rate).
+ *      --buf N:   IO buffer frames for --latency (default 64).
+ *      --thresh X: --latency detection threshold, linear (default 0.05; lower
+ *                 it if the loopback level is weak).
  *      --latency: LOOPBACK round-trip latency measurement. Patch a cable from an
  *                 RK3 OUTPUT jack to an RK3 INPUT jack first. Emits one impulse
  *                 per second on output, detects its arrival on input, and reports
@@ -27,7 +31,10 @@
 #include <unistd.h>
 
 #define RK3_UID "RigKontrol3:17cc:1940"
-#define RATE 48000.0
+/* Stream at the device's current nominal rate (read in main) so the AUHAL never
+ * resamples; --rate N switches the device first. */
+static double g_rate = 48000.0;
+#define RATE g_rate
 
 static AudioDeviceID find_device(void)
 {
@@ -185,10 +192,11 @@ static int run_input(AudioDeviceID dev, double seconds)
  * shares one clock domain and the in-minus-out delta is the true round-trip
  * (output presentation + analog loopback + input).
  */
-#define LAT_IMP_LEN     48        /* impulse width in frames (~1ms) */
+#define LAT_IMP_LEN     ((int)(RATE / 1000))  /* impulse width: 1 ms at any rate */
 #define LAT_IMP_AMP     0.95f      /* near full-scale for a strong loopback */
-#define LAT_THRESH      0.05f      /* input detection threshold (above noise) */
-#define LAT_PERIOD      48000.0   /* one impulse per second */
+static float g_lat_thresh = 0.05f; /* input detection threshold (--thresh X) */
+#define LAT_THRESH      g_lat_thresh
+#define LAT_PERIOD      RATE      /* one impulse per second */
 #define LAT_TIMEOUT     0.5       /* give up on a pending impulse after this */
 #define LAT_MAX         64
 
@@ -352,6 +360,9 @@ static int run_latency(AudioDeviceID dev, double seconds)
 			       "developer.\n");
 		return 1;
 	}
+	printf("  raw:");
+	for (int i = 0; i < n; i++) printf(" %.0f", g_lat_meas[i]);
+	printf("\n");
 	qsort(g_lat_meas, n, sizeof(double), cmp_d);
 	double sum = 0; for (int i = 0; i < n; i++) sum += g_lat_meas[i];
 	double med = g_lat_meas[n / 2];
@@ -367,11 +378,16 @@ int main(int argc, char **argv)
 {
 	double seconds = 4.0;
 	int do_input = 0, do_latency = 0;
+	double want_rate = 0.0;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--in") == 0) do_input = 1;
 		else if (strcmp(argv[i], "--latency") == 0) do_latency = 1;
 		else if (strcmp(argv[i], "--buf") == 0 && i + 1 < argc)
 			g_lat_bufsize = (UInt32)atoi(argv[++i]);
+		else if (strcmp(argv[i], "--thresh") == 0 && i + 1 < argc)
+			g_lat_thresh = (float)atof(argv[++i]);
+		else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc)
+			want_rate = atof(argv[++i]);
 		else seconds = atof(argv[i]);
 	}
 
@@ -380,6 +396,21 @@ int main(int argc, char **argv)
 		fprintf(stderr, "RigKontrol 3 device not found (driver installed?)\n");
 		return 1;
 	}
+
+	AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate,
+		kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	Float64 cur_rate = 0; UInt32 rsz = sizeof(cur_rate);
+	AudioObjectGetPropertyData(dev, &ra, 0, NULL, &rsz, &cur_rate);
+	if (want_rate > 0 && want_rate != cur_rate) {
+		if (AudioObjectSetPropertyData(dev, &ra, 0, NULL,
+				sizeof(want_rate), &want_rate) != noErr)
+			fprintf(stderr, "warn: could not set rate %.0f\n", want_rate);
+		sleep(2);                     /* let the config change land */
+		rsz = sizeof(cur_rate);
+		AudioObjectGetPropertyData(dev, &ra, 0, NULL, &rsz, &cur_rate);
+	}
+	if (cur_rate > 0) g_rate = cur_rate;
+	printf("device rate = %.0f Hz\n", g_rate);
 
 	if (do_latency) {
 		if (seconds < 3.0) seconds = 6.0;  /* need a few impulses */
