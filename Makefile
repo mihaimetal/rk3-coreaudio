@@ -32,7 +32,7 @@ all: usbprobe handshake codectest stream epdump
 
 usbprobe: $(BUILD)/usbprobe
 handshake: $(BUILD)/handshake
-codectest: $(BUILD)/codectest
+codectest: $(BUILD)/codectest $(BUILD)/synctest
 stream: $(BUILD)/stream
 epdump: $(BUILD)/epdump
 
@@ -41,8 +41,9 @@ $(BUILD)/stream: tools/stream.c $(STREAM_SRC) usb_iokit.h caiaq_protocol.h codec
 	@echo "Built $@ — run ./build/stream <seconds> [--play] with the RK3 plugged in."
 
 # Codec unit test — no hardware required.
-test: $(BUILD)/codectest
+test: $(BUILD)/codectest $(BUILD)/synctest
 	./$(BUILD)/codectest
+	./$(BUILD)/synctest
 
 $(BUILD)/codectest: tools/codectest.c codec_mode2.c codec_mode2.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/codectest.c codec_mode2.c -o $@
@@ -255,3 +256,8 @@ $(BUILD):
 
 clean:
 	rm -rf $(BUILD)
+
+$(BUILD)/synctest: tools/synctest.c runloop_sync.h | $(BUILD)
+	$(CC) -Wall -Wextra -O1 -g -fblocks -fsanitize=address -fsanitize-address-use-after-return=always tools/synctest.c -framework CoreFoundation -o $@
+
+$(DRIVER_BUNDLE): runloop_sync.h
