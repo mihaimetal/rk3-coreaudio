@@ -1,6 +1,7 @@
 /* rk3_engine.c — see rk3_engine.h */
 
 #include "rk3_engine.h"
+#include "runloop_sync.h"
 #include "rk3_midi.h"          /* RK3_MIDI_UDP_PORT */
 
 #include <os/log.h>
@@ -951,31 +952,16 @@ static void *engine_thread(void *arg)
 	return NULL;
 }
 
-/*
- * Run `work` on the engine thread's run loop and block (bounded) until it
- * completes. The isoc prime/abort must touch the IOUSBLib async machinery from
- * the run-loop thread, but StartIO/StopIO call in on CoreAudio's thread — this
- * marshals the work across. Bounded wait so a wedged engine can't hang StartIO.
- */
+/* Serialize USB work with the engine. A queue timeout cancels the work;
+ * an already executing operation is joined before the caller can tear down. */
 static bool engine_sync(struct rk3_engine *e, int max_ms, void (^work)(void))
 {
-	if (!e->runloop || !atomic_load_explicit(&e->running, memory_order_acquire))
-		return false;
-	atomic_int done;
-	atomic_init(&done, 0);
-	atomic_int *donep = &done;
-	CFRunLoopPerformBlock(e->runloop, kCFRunLoopDefaultMode, ^{
-		work();
-		atomic_store_explicit(donep, 1, memory_order_release);
-	});
-	CFRunLoopWakeUp(e->runloop);
-	for (int i = 0; i < max_ms * 2; i++) {    /* usleep(500) => 2 iters/ms */
-		if (atomic_load_explicit(&done, memory_order_acquire))
-			return true;
-		usleep(500);
-	}
-	ELOG("engine_sync: timed out (%d ms) waiting for engine thread", max_ms);
-	return false;
+    if (!e->runloop || !atomic_load_explicit(&e->running, memory_order_acquire))
+        return false;
+    bool ok = rk3_runloop_sync(e->runloop, max_ms, work);
+    if (!ok)
+        ELOG("engine_sync: cancelled queued work after %d ms", max_ms);
+    return ok;
 }
 
 /* Reset all audio-streaming state (rings, cadence mirror, diagnostics, clock
