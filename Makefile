@@ -32,7 +32,7 @@ all: usbprobe handshake codectest stream epdump
 
 usbprobe: $(BUILD)/usbprobe
 handshake: $(BUILD)/handshake
-codectest: $(BUILD)/codectest $(BUILD)/synctest
+codectest: $(BUILD)/codectest
 stream: $(BUILD)/stream
 epdump: $(BUILD)/epdump
 
